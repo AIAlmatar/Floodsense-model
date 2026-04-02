@@ -1,8 +1,8 @@
 import os
 import json
+import logging
 import joblib
 import pandas as pd
-import numpy as np
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 
@@ -10,26 +10,28 @@ load_dotenv(dotenv_path=".env")
 
 MODEL_PATH = os.getenv("MODEL_PATH", "models/phase1_best_model.joblib")
 META_PATH = os.getenv("META_PATH", "models/phase1_metadata.json")
-
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Optional mapping file: station_id -> location_id
-STATION_MAP_PATH = os.getenv("STATION_MAP_PATH", "station_map.csv")
-
-# How much recent history to read from DB
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "6"))
-
-# Prediction write settings
 MODEL_VERSION = os.getenv("MODEL_VERSION", "phase1_v1")
 PHASE_NAME = os.getenv("PHASE_NAME", "hardware_level_only")
 MAIN_SENSOR_TYPE = os.getenv("MAIN_SENSOR_TYPE", "Ultrasonic")
-
-# Risk thresholds from predicted probability
 LOW_MAX = float(os.getenv("LOW_MAX", "0.35"))
 MEDIUM_MAX = float(os.getenv("MEDIUM_MAX", "0.65"))
+DUPLICATE_WINDOW_MINUTES = int(os.getenv("DUPLICATE_WINDOW_MINUTES", "5"))
+SAVE_PREVIEW = os.getenv("SAVE_PREVIEW", "true").lower() == "true"
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger("predict_and_insert")
 
 
 def load_model_and_meta():
+    logger.info("Loading model and metadata")
     model = joblib.load(MODEL_PATH)
     with open(META_PATH, "r") as f:
         meta = json.load(f)
@@ -39,6 +41,7 @@ def load_model_and_meta():
 def get_engine():
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL is not set")
+    logger.info("Creating database engine")
     return create_engine(DATABASE_URL)
 
 
@@ -50,27 +53,8 @@ def risk_level_from_score(score: float) -> str:
     return "high"
 
 
-def load_station_map():
-    if os.path.exists(STATION_MAP_PATH):
-        df = pd.read_csv(STATION_MAP_PATH)
-        expected = {"station_id", "location_id"}
-        if not expected.issubset(df.columns):
-            raise ValueError(f"{STATION_MAP_PATH} must contain columns: {expected}")
-        return df
-    return pd.DataFrame(columns=["station_id", "location_id"])
-
-
 def fetch_recent_sensor_data(engine):
-    """
-    Assumes your DB has:
-      sensor_reading(sensor_id, time_stamp, raw_value)
-      sensor(sensor_id, sensor_type_id, node_id, ...)
-      sensor_type(sensor_type_id, type_name, ...)
-      sensor_node(node_id, location_id, ...)
-
-    Adjust names if your schema differs slightly.
-    """
-
+    logger.info("Fetching recent ultrasonic sensor readings from database")
     query = text("""
         SELECT
             sr.sensor_id,
@@ -95,19 +79,17 @@ def fetch_recent_sensor_data(engine):
         df = pd.read_sql(query, conn, params={"lookback": LOOKBACK_HOURS})
 
     if df.empty:
+        logger.warning("No recent ultrasonic sensor data found")
         return df
 
     df["time"] = pd.to_datetime(df["time_stamp"], utc=True, errors="coerce")
     df["level_signal"] = pd.to_numeric(df["raw_value"], errors="coerce")
-
-    # Build a stable station identifier from sensor_id
     df["station_id"] = df["sensor_id"].astype(str)
 
-    # Since DB raw data does not have these cleaning flags yet, default to 0
     for col in ["man_remove", "ffill", "stamp", "outbound", "frozen", "outlier"]:
         df[col] = 0
 
-    return df[
+    df = df[
         [
             "station_id", "sensor_id", "location_id", "time",
             "level_signal",
@@ -115,12 +97,15 @@ def fetch_recent_sensor_data(engine):
         ]
     ].copy()
 
+    logger.info(
+        "Fetched %s rows for %s stations",
+        len(df),
+        df["station_id"].nunique()
+    )
+    return df
 
-def prepare_latest_features(df, meta):
-    """
-    Build the same feature set expected by the trained phase-1 model.
-    We resample to 5 minutes and then compute lag/rolling features.
-    """
+
+def prepare_latest_features(df):
     if df.empty:
         return pd.DataFrame()
 
@@ -132,7 +117,6 @@ def prepare_latest_features(df, meta):
 
         g = g.set_index("time")
 
-        # Resample to 5 min to match training
         out = g.resample("5min").agg({
             "level_signal": "mean",
             "man_remove": "max",
@@ -174,31 +158,34 @@ def prepare_latest_features(df, meta):
     feat_df["hour"] = feat_df["time"].dt.hour
     feat_df["day_of_week"] = feat_df["time"].dt.dayofweek
 
-    # Keep latest row per station, only if enough history exists
     latest_rows = []
+    required_cols = [
+        "level_signal",
+        "level_lag_1", "level_lag_3", "level_lag_6",
+        "level_diff_1", "level_diff_3", "level_diff_6",
+        "level_roll_mean_3", "level_roll_mean_6",
+        "level_roll_max_6", "level_roll_std_3",
+        "man_remove", "ffill", "stamp", "outbound", "frozen", "outlier",
+        "hour", "day_of_week",
+    ]
+
+    skipped = 0
     for station_id, g in feat_df.groupby("station_id"):
         g = g.sort_values("time").copy()
         row = g.iloc[-1]
 
-        required_cols = [
-            "level_signal",
-            "level_lag_1", "level_lag_3", "level_lag_6",
-            "level_diff_1", "level_diff_3", "level_diff_6",
-            "level_roll_mean_3", "level_roll_mean_6",
-            "level_roll_max_6", "level_roll_std_3",
-            "man_remove", "ffill", "stamp", "outbound", "frozen", "outlier",
-            "hour", "day_of_week",
-        ]
-
         if row[required_cols].isna().any():
+            skipped += 1
             continue
 
         latest_rows.append(row)
 
     if not latest_rows:
+        logger.warning("No stations had enough history for feature generation")
         return pd.DataFrame()
 
     latest = pd.DataFrame(latest_rows).reset_index(drop=True)
+    logger.info("Built feature rows for %s stations, skipped %s", len(latest), skipped)
     return latest
 
 
@@ -227,18 +214,58 @@ def build_prediction_rows(features_df, model, meta):
         axis=1
     )
 
+    logger.info("Built %s prediction rows", len(out))
     return out
 
 
-def insert_predictions(engine, pred_df):
-    """
-    Assumes prediction table has at least:
-      location_id, time_stamp, risk_score, risk_level, predicted_hazard_ts, meta_json
-
-    Adjust column names if needed.
-    """
+def filter_duplicates(engine, pred_df):
     if pred_df.empty:
-        print("No predictions to insert.")
+        return pred_df
+
+    query = text("""
+        SELECT 1
+        FROM prediction
+        WHERE location_id = :location_id
+          AND time_stamp >= NOW() - (:dup_window || ' minutes')::interval
+        LIMIT 1
+    """)
+
+    kept = []
+    skipped = 0
+
+    with engine.connect() as conn:
+        for _, r in pred_df.iterrows():
+            location_id = r["location_id"]
+            if pd.isna(location_id):
+                skipped += 1
+                continue
+
+            exists = conn.execute(
+                query,
+                {
+                    "location_id": int(location_id),
+                    "dup_window": DUPLICATE_WINDOW_MINUTES
+                }
+            ).fetchone()
+
+            if exists:
+                skipped += 1
+                continue
+
+            kept.append(r)
+
+    filtered = pd.DataFrame(kept) if kept else pd.DataFrame(columns=pred_df.columns)
+    logger.info(
+        "Duplicate filter kept %s rows and skipped %s rows",
+        len(filtered),
+        skipped
+    )
+    return filtered
+
+
+def insert_predictions(engine, pred_df):
+    if pred_df.empty:
+        logger.warning("No predictions to insert")
         return
 
     insert_sql = text("""
@@ -275,36 +302,41 @@ def insert_predictions(engine, pred_df):
         })
 
     if not rows:
-        print("Predictions were created, but no valid location_id values were available.")
+        logger.warning("Predictions existed, but none had a valid location_id")
         return
 
     with engine.begin() as conn:
         conn.execute(insert_sql, rows)
 
-    print(f"Inserted {len(rows)} predictions into prediction table.")
+    logger.info("Inserted %s predictions into prediction table", len(rows))
 
 
 def main():
+    logger.info("Prediction job started")
     model, meta = load_model_and_meta()
     engine = get_engine()
 
     raw_df = fetch_recent_sensor_data(engine)
     if raw_df.empty:
-        print("No recent ultrasonic sensor data found.")
+        logger.warning("Job finished: no source data")
         return
 
-    features_df = prepare_latest_features(raw_df, meta)
+    features_df = prepare_latest_features(raw_df)
     if features_df.empty:
-        print("Not enough history to build prediction features.")
+        logger.warning("Job finished: not enough history to compute features")
         return
 
     pred_df = build_prediction_rows(features_df, model, meta)
 
-    # Save a local copy for debugging
-    os.makedirs("outputs", exist_ok=True)
-    pred_df.to_csv("outputs/db_predictions_preview.csv", index=False)
+    if SAVE_PREVIEW:
+        os.makedirs("outputs", exist_ok=True)
+        pred_df.to_csv("outputs/db_predictions_preview.csv", index=False)
+        logger.info("Saved preview to outputs/db_predictions_preview.csv")
 
+    pred_df = filter_duplicates(engine, pred_df)
     insert_predictions(engine, pred_df)
+
+    logger.info("Prediction job finished")
 
 
 if __name__ == "__main__":
