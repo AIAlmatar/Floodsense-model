@@ -1,6 +1,5 @@
 import os
 import json
-import glob
 import pandas as pd
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
@@ -8,7 +7,7 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=".env")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-TRAINING_CSV_DIR = os.getenv("TRAINING_CSV_DIR", "data/cleaned_csvs")
+TRAINING_DATASET_PATH = os.getenv("TRAINING_DATASET_PATH", "outputs/phase1_training_dataset.csv")
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "24"))
 
 if not DATABASE_URL:
@@ -17,18 +16,20 @@ if not DATABASE_URL:
 engine = create_engine(DATABASE_URL)
 
 def load_training_signal():
-    files = sorted(glob.glob(os.path.join(TRAINING_CSV_DIR, "*.csv")))
-    if not files:
-        raise FileNotFoundError(f"No training CSV files found in {TRAINING_CSV_DIR}")
+    if not os.path.exists(TRAINING_DATASET_PATH):
+        raise FileNotFoundError(f"Training dataset file not found: {TRAINING_DATASET_PATH}")
 
-    vals = []
-    for f in files:
-        df = pd.read_csv(f, usecols=["level"])
-        df["level"] = pd.to_numeric(df["level"], errors="coerce")
-        vals.append(df["level"].dropna())
+    df = pd.read_csv(TRAINING_DATASET_PATH)
 
-    s = pd.concat(vals, ignore_index=True)
-    return s
+    if "level_signal" in df.columns:
+        s = pd.to_numeric(df["level_signal"], errors="coerce").dropna()
+        return s
+
+    if "level" in df.columns:
+        s = pd.to_numeric(df["level"], errors="coerce").dropna()
+        return s
+
+    raise ValueError("Training dataset does not contain 'level_signal' or 'level' column")
 
 def load_live_ultrasonic_signal():
     query = text("""
@@ -57,10 +58,7 @@ def load_live_ultrasonic_signal():
 
 def describe_series(name, s):
     if s.empty:
-        return {
-            "name": name,
-            "count": 0
-        }
+        return {"name": name, "count": 0}
     return {
         "name": name,
         "count": int(s.shape[0]),
@@ -80,7 +78,7 @@ def main():
     live = load_live_ultrasonic_signal()
 
     report = {
-        "training_level": describe_series("training_level", training),
+        "training_signal": describe_series("training_signal", training),
         "live_raw_value": describe_series("live_raw_value", live),
     }
 
@@ -89,6 +87,7 @@ def main():
     if not training.empty and not live.empty:
         train_p50 = training.quantile(0.50)
         live_p50 = live.quantile(0.50)
+
         ratio = None
         if train_p50 != 0:
             ratio = float(live_p50 / train_p50)
@@ -100,10 +99,10 @@ def main():
             print(f"- median ratio live/training: {ratio:.4f}")
 
         if ratio is not None and (ratio < 0.5 or ratio > 2.0):
-            print("\nWarning: live DB raw_value scale looks meaningfully different from training level scale.")
+            print("\nWarning: live DB raw_value scale looks meaningfully different from training signal scale.")
             print("You should calibrate raw_value or retrain using DB-shaped values.")
         else:
-            print("\nThe live DB raw_value scale looks reasonably close to the training level scale.")
+            print("\nThe live DB raw_value scale looks reasonably close to the training signal.")
 
 if __name__ == "__main__":
     main()
