@@ -6,7 +6,7 @@ import numpy as np
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(dotenv_path=".env")
 
 MODEL_PATH = os.getenv("MODEL_PATH", "models/phase1_best_model.joblib")
 META_PATH = os.getenv("META_PATH", "models/phase1_metadata.json")
