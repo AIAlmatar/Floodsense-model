@@ -11,6 +11,7 @@ load_dotenv(dotenv_path=".env")
 MODEL_PATH = os.getenv("MODEL_PATH", "models/phase1_best_model.joblib")
 META_PATH = os.getenv("META_PATH", "models/phase1_metadata.json")
 DATABASE_URL = os.getenv("DATABASE_URL")
+PREDICTION_LOG_PATH = "outputs/prediction_run_log.csv"
 
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "6"))
 MODEL_VERSION = os.getenv("MODEL_VERSION", "phase1_v1")
@@ -51,6 +52,20 @@ def risk_level_from_score(score: float) -> str:
     elif score < MEDIUM_MAX:
         return "medium"
     return "high"
+
+def append_prediction_log(pred_df):
+    if pred_df.empty:
+        return
+
+    os.makedirs("outputs", exist_ok=True)
+
+    log_df = pred_df.copy()
+    log_df["logged_at"] = pd.Timestamp.utcnow()
+
+    if os.path.exists(PREDICTION_LOG_PATH):
+        log_df.to_csv(PREDICTION_LOG_PATH, mode="a", header=False, index=False)
+    else:
+        log_df.to_csv(PREDICTION_LOG_PATH, index=False)
 
 
 def fetch_recent_sensor_data(engine):
@@ -334,6 +349,7 @@ def main():
         logger.info("Saved preview to outputs/db_predictions_preview.csv")
 
     pred_df = filter_duplicates(engine, pred_df)
+    append_prediction_log(pred_df)
     insert_predictions(engine, pred_df)
 
     logger.info("Prediction job finished")
